@@ -1913,6 +1913,7 @@ def capacity_checks():
     Retry-After / 权重超容量 409 / 容量下调低于有效占用 409 保留原配置 /
     续期仅认凭据（错误 / 过期 409 not_found）/ 释放仅认凭据且幂等 /
     过期与旧凭据不影响新占用 / 短 TTL 槽位回收 / 参数校验 /
+    汇总随集合清空与自然过期失效（旧计数不阻挡新申请）/
     并发绝不超配（40 并发恰好放行容量笔）。"""
     base = f"smoke-cap:{int(time.time() * 1000)}"
     acq_path = "/v1/capacity/slots/acquire"
@@ -2172,6 +2173,35 @@ def capacity_checks():
     code, b = acquire(w_key, weight=1)
     check("cap weighted leftover fits 1",
           code == 200 and b["remaining"] == 0, f"{code} {b}")
+
+    # 汇总失效（集合清空）：最后一笔释放后旧计数不得阻挡后续申请
+    empty_key = f"{base}:empty"
+    code, _ = set_cap(empty_key, 2)
+    code, s = acquire(empty_key, weight=2)
+    check("cap empty-setup full", code == 200 and s["remaining"] == 0, f"{code} {s}")
+    code, _ = acquire(empty_key, weight=1)
+    check("cap empty-setup saturated", code == 429, f"code={code}")
+    code, b = release(empty_key, s["credential"])
+    check("cap empty-setup release to zero",
+          code == 200 and b["released"] is True and b["remaining"] == 2, f"{code} {b}")
+    # 汇总随集合清空而失效：可立即重新申请满容量
+    code, b = acquire(empty_key, weight=2)
+    check("cap fresh acquire after set emptied not blocked",
+          code == 200 and b["acquired"] and b["remaining"] == 0, f"{code} {b}")
+    code, b = release(empty_key, b["credential"])
+
+    # 汇总失效（集合自然过期）：短 TTL 占用与汇总一起过期后，申请不被旧计数阻挡
+    expire_key = f"{base}:expire"
+    code, _ = set_cap(expire_key, 2)
+    code, s = acquire(expire_key, weight=2, ttl=300)
+    check("cap expire-setup full", code == 200 and s["remaining"] == 0, f"{code} {s}")
+    code, _ = acquire(expire_key, weight=1)
+    check("cap expire-setup saturated", code == 429, f"code={code}")
+    time.sleep(0.7)
+    code, b = acquire(expire_key, weight=2)
+    check("cap fresh acquire after natural expiry not blocked",
+          code == 200 and b["acquired"] and b["remaining"] == 0, f"{code} {b}")
+    code, b = release(expire_key, b["credential"])
 
 
 if __name__ == "__main__":

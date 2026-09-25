@@ -188,6 +188,12 @@ def slots_key(settings: Settings, resource_key: str) -> str:
     return f"{settings.key_prefix}:slots:{resource_key}"
 
 
+def slots_used_key(settings: Settings, resource_key: str) -> str:
+    # 资源键已占用权重汇总（Redis String 整数），与占用集合一一对应、
+    # 同生共灭；Lua 脚本内随清旧 / 申请 / 释放增量维护，常规核算无需扫描集合
+    return f"{settings.key_prefix}:slots-used:{resource_key}"
+
+
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
 
@@ -1139,10 +1145,11 @@ async def set_capacity(
 ) -> CapacitySetResponse:
     """设置（整体调整）某资源键允许的有效占用权重总量上限。
 
-    - 调整在**单个 Redis Lua 脚本**内基于服务器时间先清理过期占用、
-      核算当前有效占用量，再比较新容量：新容量**低于当前有效占用量**时返回
-      **409** `reason=below_active`，**不写入容量键、不动任何占用**，响应体
-      `capacity` 回带当前仍生效的旧配置（从未配置时为 `null`）。
+    - 调整在**单个 Redis Lua 脚本**内基于服务器时间先清理过期占用（逐笔扣减
+      已占用权重汇总）、经汇总核算当前有效占用量，再比较新容量：新容量**低于
+      当前有效占用量**时返回 **409** `reason=below_active`，**不写入容量键、
+      不动任何占用**，响应体 `capacity` 回带当前仍生效的旧配置（从未配置时为
+      `null`）。
     - 新容量不低于有效占用量时原子写入新配置（容量键无 TTL，整体替换），
       返回 200、生效容量与当前有效占用量 `active_weight`。
     - 资源键必须先设置容量才能申请占用；未配置资源键的申请返回
@@ -1152,6 +1159,7 @@ async def set_capacity(
         keys=[
             capacity_key(settings, resource_key),
             slots_key(settings, resource_key),
+            slots_used_key(settings, resource_key),
         ],
         args=[str(req.capacity)],
     )
@@ -1192,9 +1200,10 @@ async def acquire_slot(
 ) -> SlotAcquireResponse:
     """按资源键申请一个带 TTL 的加权处理槽位，供多个工作进程共享有上限的容量。
 
-    - "按 Redis 服务器时间清理过期占用 → 读取容量 → 累计有效占用权重 →
-      判定剩余 → 写入新占用"由**单个 Lua 脚本**原子完成，同一资源键的并发申请
-      严格串行，**绝不超配**；容量不足时不写入任何占用。
+    - "按 Redis 服务器时间清理过期占用（逐笔扣减已占用权重汇总）→ 读取容量 →
+      读汇总取得有效占用权重 → 判定剩余 → 写入新占用并同步汇总"由**单个 Lua
+      脚本**原子完成，同一资源键的并发申请严格串行，**绝不超配**；容量不足时
+      不写入任何占用。常规核算只读汇总整数，不扫描全部占用。
     - 申请可声明整数 `weight`（默认 1，例如批量条数 / GPU 卡数）；
       `weight` 大于当前容量时永远无法满足，返回 **409**。
     - 成功返回 **200**、本次占用的**独立凭据** `credential`（服务端生成，
@@ -1208,8 +1217,9 @@ async def acquire_slot(
     nonce = uuid.uuid4().hex
     ckey = capacity_key(settings, req.resource_key)
     skey = slots_key(settings, req.resource_key)
+    ukey = slots_used_key(settings, req.resource_key)
     result = await scripts.slot_acquire(
-        keys=[ckey, skey],
+        keys=[ckey, skey, ukey],
         args=[str(req.weight), nonce, str(ttl)],
     )
 
@@ -1298,7 +1308,10 @@ async def renew_slot(
     """
     ttl = resolve_ttl(req.ttl_ms, settings)
     result = await scripts.slot_renew(
-        keys=[slots_key(settings, req.resource_key)],
+        keys=[
+            slots_key(settings, req.resource_key),
+            slots_used_key(settings, req.resource_key),
+        ],
         args=[
             req.credential,
             str(ttl),
@@ -1341,7 +1354,10 @@ async def release_slot(
       旧持有者在占用过期后的释放不会误删新占用（新占用是全新凭据）。
     """
     result = await scripts.slot_release(
-        keys=[slots_key(settings, req.resource_key)],
+        keys=[
+            slots_key(settings, req.resource_key),
+            slots_used_key(settings, req.resource_key),
+        ],
         args=[req.credential, capacity_key(settings, req.resource_key)],
     )
     # {是否释放(1/0), 释放权重, 剩余容量}

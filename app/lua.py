@@ -77,14 +77,25 @@
       weight 编码在 member 尾部（与限流 member 同一约定）；
     score 为该占用的到期时刻（Redis 服务器毫秒）。
   凭据由服务端生成（uuid + 本次权重），每次申请独立、不可能碰撞。
+- 已占用权重汇总键 {prefix}:slots-used:{resource_key} 是一个整数 String，
+  与占用集合一一对应、同生共灭，保存"当前有效占用权重之和"。所有脚本入口都在
+  同一 Lua 操作内增量维护它：清旧逐笔扣减、申请 INCRBY 增、释放 INCRBY 减、
+  续期权重不变不动汇总，常规请求直接 GET 汇总即可核算剩余，无需 ZRANGE 扫描
+  全部有效占用。
+- 首次遇到"占用集合非空但缺少汇总"（升级前写入的数据）时，脚本内扫描有效
+  占用重建一次汇总并同步 TTL，之后即回到增量维护路径。
+- 占用集合清空或自然过期（PEXPIRE 与集合对齐，另在清旧时防御性 DEL 残留）时
+  汇总同步失效，绝不让旧计数阻挡后续申请。
 - 所有脚本入口都先按 redis.call('TIME') 的服务器时间清理 score <= now 的
-  过期占用（ZREMRANGEBYSCORE），再逐项解析 member 尾部权重并累计"有效占用量"，
-  清旧与核算 / 写入在同一个脚本内原子完成：并发申请严格串行，绝不超配。
+  过期占用（ZRANGEBYSCORE 取出到期 member 逐笔算权重，ZREMRANGEBYSCORE 删除，
+  对汇总逐笔 INCRBY 扣减），清旧与核算 / 写入在同一个脚本内原子完成：
+  并发申请严格串行，绝不超配。
 - 续期与释放都以凭据（完整 ZSet member）为唯一凭证：member 不存在即 not_found
   （从未签发或已过期清理），不做任何修改；故过期占用或旧凭据的续期 / 释放
   不可能影响过期后新申请得到的新占用（新占用是全新的 member）。
-- 占用集合为空时由脚本 DEL 回收；非空时按 (最大到期 - now + 1) 设置 PEXPIRE，
-  仅作无流量残留键的兜底回收（比较口径比 score 判定多 1ms，不会提前删除）。
+- 占用集合为空时由脚本 DEL 回收（汇总同时 DEL）；非空时按 (最大到期 - now + 1)
+  对占用集合与汇总设置相同 PEXPIRE，仅作无流量残留键的兜底回收
+  （比较口径比 score 判定多 1ms，不会提前删除）。
   是否有效一律以 score 与服务器时间的比较为准，与租约的 expires_at/PEXPIRE
   双重保障同构。
 """
@@ -807,8 +818,9 @@ end
 return {0, remaining, reset_at, retry_after}
 """
 
-# 并发容量公共头：服务器时间、按服务器时间清理过期占用、累计当前有效占用权重，
-# 以及占用集合的兜底 TTL 回收。拼接到每个容量脚本前，保证四个脚本的
+# 并发容量公共头：服务器时间、按服务器时间清理过期占用（逐笔扣减汇总）、
+# 已占用权重汇总的读取（缺失时在脚本内重建一次）与兜底 TTL 回收。
+# 拼接到每个容量脚本前，保证四个脚本的
 # "清旧 -> 核算"口径逐字一致。
 _CAPACITY_LUA = """
 -- Redis 服务器毫秒（与全部租约 / 限流脚本同一时钟口径）
@@ -822,26 +834,65 @@ local function member_weight(member)
   return tonumber(string.match(member, ':(%d+)$'))
 end
 
--- 清理 score <= now 的过期占用，返回清理后所有有效占用的权重之和
-local function active_weight(key, now)
-  redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-  local used = 0
-  local members = redis.call('ZRANGE', key, 0, -1)
-  for _, m in ipairs(members) do
-    used = used + member_weight(m)
+-- 清理 score <= now 的过期占用，并对已占用权重汇总逐笔 INCRBY 扣减。
+-- 仅 ZRANGEBYSCORE 取出到期 member 解析权重，不扫描全部有效占用；
+-- 汇总缺失（升级前数据）时在此不动它，留给 cap_used 重建。
+local function cap_reap(slots, usedkey, now)
+  local expired = redis.call('ZRANGEBYSCORE', slots, '-inf', now)
+  if #expired > 0 then
+    redis.call('ZREMRANGEBYSCORE', slots, '-inf', now)
+    if redis.call('EXISTS', usedkey) == 1 then
+      for _, m in ipairs(expired) do
+        redis.call('INCRBY', usedkey, -member_weight(m))
+      end
+    end
   end
-  return used
 end
 
--- 占用集合兜底回收：空集合直接 DEL；非空按 (最大到期 - now + 1) 设置 PEXPIRE。
--- +1ms 使键 TTL 永远不短于最晚到期判定窗口，PEXPIRE 仅回收无流量残留键，
--- 占用是否有效一律以 score 与服务器时间比较为准。
-local function reslot_ttl(key, now)
-  local newest = redis.call('ZRANGE', key, -1, -1, 'WITHSCORES')
+-- 返回清理后有效占用的权重之和：常规路径直接 GET 汇总（O(1)，不扫描集合）。
+-- 占用集合已清空 / 自然过期（清旧删光最后一个 member 时 Redis 自动删键）时，
+-- 汇总无论是否残留都立即失效，绝不以旧计数阻挡后续申请；占用集合非空但缺少
+-- 汇总（首次遇到升级前数据）时在脚本内扫描有效占用重建一次，并把占用集合的
+-- 兜底 TTL 同步到汇总。
+local function cap_used(slots, usedkey, now)
+  cap_reap(slots, usedkey, now)
+  local used = redis.call('GET', usedkey)
+  if redis.call('EXISTS', slots) == 0 then
+    if used then
+      redis.call('DEL', usedkey)
+    end
+    return 0
+  end
+  if used then
+    return tonumber(used)
+  end
+  local total = 0
+  local members = redis.call('ZRANGE', slots, 0, -1)
+  for _, m in ipairs(members) do
+    total = total + member_weight(m)
+  end
+  redis.call('SET', usedkey, total)
+  local ttl = redis.call('PTTL', slots)
+  if ttl > 0 then
+    redis.call('PEXPIRE', usedkey, ttl)
+  end
+  return total
+end
+
+-- 占用集合兜底回收：空集合直接 DEL（汇总同时 DEL）；非空按
+-- (最大到期 - now + 1) 对集合与汇总设置相同 PEXPIRE。+1ms 使键 TTL 永远不短于
+-- 最晚到期判定窗口，PEXPIRE 仅回收无流量残留键，占用是否有效一律以 score 与
+-- 服务器时间比较为准。汇总在每次写入路径都会被 cap_used 保证存在，故非空分支
+-- 直接对齐 TTL 即可（汇总随集合同生共灭，集合清空 / 过期后汇总绝不残留）。
+local function cap_reslot_ttl(slots, usedkey, now)
+  local newest = redis.call('ZRANGE', slots, -1, -1, 'WITHSCORES')
   if #newest == 0 then
-    redis.call('DEL', key)
+    redis.call('DEL', slots)
+    redis.call('DEL', usedkey)
   else
-    redis.call('PEXPIRE', key, tonumber(newest[2]) - now + 1)
+    local ttl = tonumber(newest[2]) - now + 1
+    redis.call('PEXPIRE', slots, ttl)
+    redis.call('PEXPIRE', usedkey, ttl)
   end
 end
 """
@@ -851,12 +902,13 @@ end
 # 未配置（KEYS[1] 不存在）时当前容量返回 0、旧容量返回 nil（Python 侧转成 None）。
 # KEYS[1] = 容量配置键 {prefix}:capacity:{resource_key}
 # KEYS[2] = 占用集合键 {prefix}:slots:{resource_key}
+# KEYS[3] = 已占用权重汇总键 {prefix}:slots-used:{resource_key}
 # ARGV[1] = 新容量（整数权重，>0；上限由服务端 pydantic 校验）
 # 成功返回   {1, 新容量, 当前有效占用量}
 # 拒绝返回   {0, 'below_active', 旧容量（不存在为 false）, 当前有效占用量}
 CAPACITY_SET_LUA = _CAPACITY_LUA + """
 local now = cap_now()
-local used = active_weight(KEYS[2], now)
+local used = cap_used(KEYS[2], KEYS[3], now)
 local new_capacity = tonumber(ARGV[1])
 
 if new_capacity < used then
@@ -868,11 +920,12 @@ redis.call('SET', KEYS[1], new_capacity)
 return {1, new_capacity, used}
 """
 
-# 申请占用：服务器时间清旧 -> 读容量 -> 核算剩余 -> 写入新占用，单脚本原子完成。
-# Redis 单线程串行执行脚本，同一资源键的并发申请不会超配；超限时不写入。
-# 凭据 member = ARGV[2](uuid32) .. ':' .. weight，score = now + ttl，
-# 每次申请独立，过期后旧 member 被清旧移除，新申请得到全新凭据。
-# KEYS[1] = 容量配置键, KEYS[2] = 占用集合键
+# 申请占用：服务器时间清旧 -> 读容量 -> 读汇总核算剩余 -> 写入新占用并同步汇总，
+# 单脚本原子完成。Redis 单线程串行执行脚本，同一资源键的并发申请不会超配；
+# 超限时不写入。凭据 member = ARGV[2](uuid32) .. ':' .. weight，
+# score = now + ttl，每次申请独立，过期后旧 member 被清旧移除，
+# 新申请得到全新凭据。
+# KEYS[1] = 容量配置键, KEYS[2] = 占用集合键, KEYS[3] = 已占用权重汇总键
 # ARGV[1] = 本次权重 weight（正整数；服务端已保证 <= 容量上限）
 # ARGV[2] = uuid（32 位十六进制）
 # ARGV[3] = ttl_ms
@@ -881,7 +934,7 @@ return {1, new_capacity, used}
 # 容量不足返回 {0, 'capacity_exhausted', 剩余容量, 最早到期, 重试毫秒, 容量}
 CAPACITY_ACQUIRE_LUA = _CAPACITY_LUA + """
 local now = cap_now()
-local used = active_weight(KEYS[2], now)
+local used = cap_used(KEYS[2], KEYS[3], now)
 
 local capacity = redis.call('GET', KEYS[1])
 if not capacity then
@@ -905,28 +958,25 @@ end
 local credential = ARGV[2] .. ':' .. weight
 local expires_at = now + tonumber(ARGV[3])
 redis.call('ZADD', KEYS[2], expires_at, credential)
-reslot_ttl(KEYS[2], now)
+redis.call('INCRBY', KEYS[3], weight)
+cap_reslot_ttl(KEYS[2], KEYS[3], now)
 return {1, credential, expires_at, capacity - used - weight, capacity}
 """
 
 # 续期：仅当凭据（完整 member）仍存在于占用集合中才刷新其到期时刻。
 # 凭据不存在（从未签发，或已过期被清旧删除）即 not_found，不做任何修改；
 # 故过期占用 / 旧凭据的续期不可能影响其后新申请得到的新占用。
-# KEYS[1] = 占用集合键
+# 续期不改变占用权重，汇总无需增减（仍经 cap_used 完成清旧与汇总对账）。
+# KEYS[1] = 占用集合键, KEYS[2] = 已占用权重汇总键
 # ARGV[1] = 凭据, ARGV[2] = ttl_ms, ARGV[3] = 容量配置键（用于回算剩余容量）
 # 成功返回 {1, 'ok', 新 expires_at_ms, 剩余容量}
 # 失败返回 {0, 'not_found', 0, 剩余容量}
 CAPACITY_RENEW_LUA = _CAPACITY_LUA + """
 local now = cap_now()
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local used = cap_used(KEYS[1], KEYS[2], now)
 
 if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
   local cap = tonumber(redis.call('GET', ARGV[3])) or 0
-  local used = 0
-  local members = redis.call('ZRANGE', KEYS[1], 0, -1)
-  for _, m in ipairs(members) do
-    used = used + member_weight(m)
-  end
   local remaining = cap - used
   if remaining < 0 then remaining = 0 end
   return {0, 'not_found', 0, remaining}
@@ -934,12 +984,7 @@ end
 
 local new_expires = now + tonumber(ARGV[2])
 redis.call('ZADD', KEYS[1], 'XX', new_expires, ARGV[1])
-reslot_ttl(KEYS[1], now)
-local used = 0
-local members = redis.call('ZRANGE', KEYS[1], 0, -1)
-for _, m in ipairs(members) do
-  used = used + member_weight(m)
-end
+cap_reslot_ttl(KEYS[1], KEYS[2], now)
 local cap = tonumber(redis.call('GET', ARGV[3])) or 0
 local remaining = cap - used
 if remaining < 0 then remaining = 0 end
@@ -948,25 +993,23 @@ return {1, 'ok', new_expires, remaining}
 
 # 释放：仅当凭据（完整 member）仍存在时删除，凭据错误 / 已过期则幂等忽略。
 # 旧持有者在占用过期后调用释放不会误删新占用（新占用是全新的 member）。
-# KEYS[1] = 占用集合键
+# 成功释放时对汇总 INCRBY 扣减本次权重；清旧产生的到期扣减在 cap_used 内逐笔完成。
+# KEYS[1] = 占用集合键, KEYS[2] = 已占用权重汇总键
 # ARGV[1] = 凭据, ARGV[2] = 容量配置键（用于回算剩余容量）
 # 返回 {是否真正释放(1/0), 释放权重（未释放为 0）, 剩余容量}
 CAPACITY_RELEASE_LUA = _CAPACITY_LUA + """
 local now = cap_now()
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local used = cap_used(KEYS[1], KEYS[2], now)
 
 local weight = 0
 if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
   weight = member_weight(ARGV[1])
   redis.call('ZREM', KEYS[1], ARGV[1])
+  redis.call('INCRBY', KEYS[2], -weight)
+  used = used - weight
 end
-reslot_ttl(KEYS[1], now)
+cap_reslot_ttl(KEYS[1], KEYS[2], now)
 
-local used = 0
-local members = redis.call('ZRANGE', KEYS[1], 0, -1)
-for _, m in ipairs(members) do
-  used = used + member_weight(m)
-end
 local cap = tonumber(redis.call('GET', ARGV[2])) or 0
 local released = 0
 if weight > 0 then released = 1 end
