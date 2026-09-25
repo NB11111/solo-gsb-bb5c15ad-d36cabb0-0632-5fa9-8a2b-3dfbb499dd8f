@@ -188,6 +188,12 @@ def slots_key(settings: Settings, resource_key: str) -> str:
     return f"{settings.key_prefix}:slots:{resource_key}"
 
 
+def slots_used_key(settings: Settings, resource_key: str) -> str:
+    # 资源键的已占用权重汇总（Redis String：当前有效占用权重之和，
+    # 与占用 ZSet 在同一 Lua 操作内联动维护，随集合清空 / 过期而失效）
+    return f"{settings.key_prefix}:slots-used:{resource_key}"
+
+
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
 
@@ -1152,6 +1158,7 @@ async def set_capacity(
         keys=[
             capacity_key(settings, resource_key),
             slots_key(settings, resource_key),
+            slots_used_key(settings, resource_key),
         ],
         args=[str(req.capacity)],
     )
@@ -1209,7 +1216,7 @@ async def acquire_slot(
     ckey = capacity_key(settings, req.resource_key)
     skey = slots_key(settings, req.resource_key)
     result = await scripts.slot_acquire(
-        keys=[ckey, skey],
+        keys=[ckey, skey, slots_used_key(settings, req.resource_key)],
         args=[str(req.weight), nonce, str(ttl)],
     )
 
@@ -1298,7 +1305,10 @@ async def renew_slot(
     """
     ttl = resolve_ttl(req.ttl_ms, settings)
     result = await scripts.slot_renew(
-        keys=[slots_key(settings, req.resource_key)],
+        keys=[
+            slots_key(settings, req.resource_key),
+            slots_used_key(settings, req.resource_key),
+        ],
         args=[
             req.credential,
             str(ttl),
@@ -1341,7 +1351,10 @@ async def release_slot(
       旧持有者在占用过期后的释放不会误删新占用（新占用是全新凭据）。
     """
     result = await scripts.slot_release(
-        keys=[slots_key(settings, req.resource_key)],
+        keys=[
+            slots_key(settings, req.resource_key),
+            slots_used_key(settings, req.resource_key),
+        ],
         args=[req.credential, capacity_key(settings, req.resource_key)],
     )
     # {是否释放(1/0), 释放权重, 剩余容量}

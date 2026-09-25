@@ -46,9 +46,17 @@ commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 容量下调低于当前有效占用 409 below_active 且保留原配置 /
 续期仅认凭据（错误 / 过期 409 not_found，不能复活旧占用）/
 释放仅认凭据且幂等、旧凭据不影响新占用 / 短 TTL 过期自动回收且续期可延长 /
-参数校验 / 并发（含加权）绝不超配。
+参数校验 / 并发（含加权）绝不超配；
+以及已占用权重汇总：
+升级前遗留的"有占用集合、缺汇总"数据在首次操作时于脚本内一次性重建、
+申请 / 释放同步增减、到期清理逐笔扣减、集合自然过期 / 清空后汇总同步失效
+且后续申请不被旧计数阻挡（直连 Redis 构造升级前数据布局验证，
+连接地址可用 SMOKE_REDIS_HOST / SMOKE_REDIS_PORT 覆盖，键前缀用
+SMOKE_KEY_PREFIX 覆盖，默认 lease）。
 """
 import json
+import os
+import socket
 import sys
 import time
 import urllib.error
@@ -195,6 +203,7 @@ def main():
     dependency_checks()
     checked_commit_checks()
     capacity_checks()
+    capacity_summary_checks()
 
     print()
     if FAILED:
@@ -2172,6 +2181,189 @@ def capacity_checks():
     code, b = acquire(w_key, weight=1)
     check("cap weighted leftover fits 1",
           code == 200 and b["remaining"] == 0, f"{code} {b}")
+
+
+class _RespClient:
+    """极简 Redis RESP 客户端（仅冒烟测试使用，仅依赖标准库）。
+
+    用于构造"升级前"的数据布局（占用 ZSet 存在但缺少已占用权重汇总键），
+    验证脚本内的一次性汇总重建与汇总失效行为——该布局无法通过公开 API 产生。
+    """
+
+    def __init__(self, host, port, timeout=5.0):
+        self._sock = socket.create_connection((host, port), timeout=timeout)
+        self._buf = b""
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def execute(self, *args):
+        parts = [f"*{len(args)}\r\n".encode()]
+        for arg in args:
+            data = str(arg).encode()
+            parts.append(b"$" + str(len(data)).encode() + b"\r\n" + data + b"\r\n")
+        self._sock.sendall(b"".join(parts))
+        return self._read_reply()
+
+    def _read_line(self):
+        while b"\r\n" not in self._buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("redis connection closed")
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\r\n", 1)
+        return line
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("redis connection closed")
+            self._buf += chunk
+        data, self._buf = self._buf[:n], self._buf[n:]
+        return data
+
+    def _read_reply(self):
+        line = self._read_line()
+        prefix, rest = line[:1], line[1:]
+        if prefix == b"+":
+            return rest.decode()
+        if prefix == b"-":
+            raise RuntimeError(rest.decode())
+        if prefix == b":":
+            return int(rest)
+        if prefix == b"$":
+            length = int(rest)
+            if length == -1:
+                return None
+            return self._read_exact(length + 2)[:-2].decode()
+        if prefix == b"*":
+            count = int(rest)
+            if count == -1:
+                return None
+            return [self._read_reply() for _ in range(count)]
+        raise RuntimeError(f"unknown RESP reply: {line!r}")
+
+
+def capacity_summary_checks():
+    """已占用权重汇总：升级前数据一次性重建 / 申请释放同步增减 /
+    到期清理逐笔扣减 / 集合自然过期或清空后汇总失效且不被旧计数阻挡。"""
+    base = f"smoke-capsum:{int(time.time() * 1000)}"
+    prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+
+    def slots(rk):
+        return f"{prefix}:slots:{rk}"
+
+    def used_key(rk):
+        return f"{prefix}:slots-used:{rk}"
+
+    def redis_get(key):
+        return r.execute("GET", key)
+
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("capsum redis reachable", False, f"{host}:{port} {exc}")
+        return
+
+    try:
+        # 1) 升级兼容：占用 ZSet 存在但缺少汇总（升级前数据布局），
+        #    首次操作在脚本内一次性重建汇总，核算结果不受影响
+        rk = f"{base}:legacy"
+        sec, usec = r.execute("TIME")
+        now_ms = int(sec) * 1000 + int(usec) // 1000
+        cred_a, cred_b = "a" * 32 + ":2", "b" * 32 + ":3"
+        r.execute("ZADD", slots(rk), now_ms + 60_000, cred_a)
+        r.execute("ZADD", slots(rk), now_ms + 60_000, cred_b)
+        r.execute("DEL", used_key(rk))
+        code, b = call("PUT", f"/v1/capacity/{rk}", {"capacity": 10})
+        check("capsum legacy rebuild on set",
+              code == 200 and b["configured"] and b["active_weight"] == 5,
+              f"{code} {b}")
+        check("capsum summary rebuilt in redis",
+              redis_get(used_key(rk)) == "5", f"GET={redis_get(used_key(rk))}")
+        # 重建后回归增量路径：申请 +3 -> 汇总 8，剩余 2
+        code, a = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk, "weight": 3, "ttl_ms": 60_000})
+        check("capsum acquire after rebuild",
+              code == 200 and a["remaining"] == 2 and a["active_weight"] == 8,
+              f"{code} {a}")
+        check("capsum summary incremented",
+              redis_get(used_key(rk)) == "8", f"GET={redis_get(used_key(rk))}")
+        # 释放升级前遗留凭据：按该笔权重扣减汇总
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk, "credential": cred_a})
+        check("capsum release legacy credential",
+              code == 200 and rel["released"] and rel["weight"] == 2
+              and rel["remaining"] == 4, f"{code} {rel}")
+        check("capsum summary decremented",
+              redis_get(used_key(rk)) == "6", f"GET={redis_get(used_key(rk))}")
+        # 续期升级前遗留凭据同样只认 member（权重不变，剩余不变）
+        code, rn = call("POST", "/v1/capacity/slots/renew",
+                        {"resource_key": rk, "credential": cred_b,
+                         "ttl_ms": 60_000})
+        check("capsum renew legacy credential",
+              code == 200 and rn["renewed"] and rn["remaining"] == 4,
+              f"{code} {rn}")
+        # 全部释放后集合清空：汇总键一并失效
+        call("POST", "/v1/capacity/slots/release",
+             {"resource_key": rk, "credential": cred_b})
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk, "credential": a["credential"]})
+        check("capsum release last slot",
+              code == 200 and rel["released"] and rel["remaining"] == 10,
+              f"{code} {rel}")
+        check("capsum summary gone when set emptied",
+              r.execute("EXISTS", slots(rk)) == 0
+              and r.execute("EXISTS", used_key(rk)) == 0,
+              f"slots={r.execute('EXISTS', slots(rk))} "
+              f"used={r.execute('EXISTS', used_key(rk))}")
+
+        # 2) 集合自然过期后汇总同步失效：后续申请不被旧计数阻挡
+        rk2 = f"{base}:expire"
+        code, _ = call("PUT", f"/v1/capacity/{rk2}", {"capacity": 2})
+        code, s = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk2, "weight": 2, "ttl_ms": 300})
+        check("capsum expire setup", code == 200 and s["acquired"], f"{code} {s}")
+        check("capsum summary tracked",
+              redis_get(used_key(rk2)) == "2", f"GET={redis_get(used_key(rk2))}")
+        # 超过占用 TTL 与兜底 PEXPIRE：集合键与汇总键都应自然过期
+        time.sleep(0.8)
+        check("capsum keys expired naturally",
+              r.execute("EXISTS", slots(rk2)) == 0
+              and r.execute("EXISTS", used_key(rk2)) == 0,
+              f"slots={r.execute('EXISTS', slots(rk2))} "
+              f"used={r.execute('EXISTS', used_key(rk2))}")
+        code, s2 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk2, "weight": 2, "ttl_ms": 60_000})
+        check("capsum no stale count blocking",
+              code == 200 and s2["acquired"] and s2["remaining"] == 0,
+              f"{code} {s2}")
+
+        # 3) 清旧逐笔扣减：一笔短 TTL 到期后，汇总只扣该笔权重
+        rk3 = f"{base}:deduct"
+        code, _ = call("PUT", f"/v1/capacity/{rk3}", {"capacity": 2})
+        code, d1 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk3, "weight": 1, "ttl_ms": 300})
+        code, d2 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk3, "weight": 1, "ttl_ms": 60_000})
+        check("capsum deduct setup",
+              d1.get("acquired") and d2.get("acquired"), f"{d1} {d2}")
+        time.sleep(0.7)  # 第一笔到期（第二笔仍在，键不会整体过期）
+        code, d3 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk3, "weight": 1, "ttl_ms": 60_000})
+        check("capsum expired weight deducted",
+              code == 200 and d3["acquired"] and d3["remaining"] == 0,
+              f"{code} {d3}")
+        check("capsum summary after deduction",
+              redis_get(used_key(rk3)) == "2", f"GET={redis_get(used_key(rk3))}")
+    finally:
+        r.close()
 
 
 if __name__ == "__main__":
